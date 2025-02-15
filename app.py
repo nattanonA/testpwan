@@ -52,65 +52,98 @@ def process_initial_excel(input_file, output_file):
 def sanitize_sheet_name(name):
     return re.sub(r'[\\/*?:[\]]', '', str(name))[:31]
 
+    
 def normalize_datetime(row):
-    try:
-        date = pd.to_datetime(row['Date'])
-        time_str = row['Start Time']
-        hours, minutes = map(int, time_str.split(':'))
-        if hours >= 24:
-            hours = hours - 24
-            date = date + pd.Timedelta(days=1)
-            time_str = f"{hours:02d}:{minutes:02d}"
-            days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            day_of_week = days[date.weekday()]
-        else:
-            day_of_week = row['Day Of Week']
-        return day_of_week, date, time_str
-    except Exception as e:
-        raise Exception(f"Error in normalize_datetime: {e}")
+    """
+    Normalize datetime when time is over 24:00
+    Returns tuple of (day_of_week, date, start_time)
+    """
+    # แปลง string เป็น datetime โดยใช้ dayfirst=True เพื่อให้วันที่ถูกต้องตามรูปแบบ DD/MM/YYYY
+    date = pd.to_datetime(row['Date'], errors='coerce', dayfirst=True)
+    if pd.isna(date):
+        return None, None, None
+
+    time_str = row['Start Time']
+    
+    # แยกชั่วโมงและนาที
+    hours, minutes = map(int, time_str.split(':'))
+    
+    # ถ้าชั่วโมงมากกว่าหรือเท่ากับ 24
+    if hours >= 24:
+        # ปรับชั่วโมงและเพิ่มวัน
+        hours -= 24
+        date = date + pd.Timedelta(days=1)
+        
+    # สร้างเวลาใหม่ในรูปแบบ HH:MM
+    time_str = f"{hours:02d}:{minutes:02d}"
+    
+    # อัพเดท Day of Week
+    days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    day_of_week = days[date.weekday()]
+    
+    return day_of_week, date, time_str
 
 def transform_excel_by_channel(input_file, output_file, brand_value, copyline_value):
     try:
         xlsx = pd.ExcelFile(input_file, engine="openpyxl")
         total_rows = 0
         is_first_sheet = True
+
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
             last_sheet_name = None
             last_sheet_rows = 0
+            
             for sheet_name in xlsx.sheet_names:
                 df = pd.read_excel(input_file, sheet_name=sheet_name, engine="openpyxl")
                 df['Duration'] = df['Duration'].apply(lambda x: str(x).split(':')[-1] if pd.notna(x) else x)
                 df['No. Of Spots'] = ''
                 df = df[~df['Channel'].str.contains('Summary', na=False)]
                 df = df.dropna(subset=['Channel'])
+                
                 channels = df['Channel'].unique()
                 for channel in channels:
                     channel_df = df[df['Channel'] == channel].copy()
+                    
+                    # แปลงและจัดการวันที่/เวลา
                     normalized_data = channel_df.apply(normalize_datetime, axis=1)
                     channel_df['Day Of Week'] = normalized_data.apply(lambda x: x[0])
                     channel_df['Date'] = normalized_data.apply(lambda x: x[1])
                     channel_df['Start Time'] = normalized_data.apply(lambda x: x[2])
+                    
+                    # เรียงข้อมูลตามวันที่และเวลา
+                    channel_df = channel_df.dropna(subset=['Date', 'Start Time'])
                     channel_df = channel_df.sort_values(['Date', 'Start Time'])
+                    
+                    # แปลงวันที่กลับเป็น string format (DD/MM/YYYY)
                     channel_df['Date'] = channel_df['Date'].dt.strftime('%d/%m/%Y')
+                    
                     columns = channel_df.columns.tolist()
                     columns.remove('Channel')
+
+                    # สร้าง new_data ตามรูปแบบที่ต้องการ
                     new_data = []
+                    
                     if is_first_sheet:
-                        new_data.append([brand_value, '', '', '', '', '', copyline_value])
+                        new_data.append([brand_value, '', '', '', '', '',copyline_value])
                         is_first_sheet = False
-                    new_data.append([channel, f'Brand : {brand_value}', '', '', '', '', copyline_value])
+
+                    new_data.append([channel, f'Brand : {brand_value}', '', '', '', '',copyline_value])
                     new_data.append(columns)
                     new_data.extend(channel_df[columns].values.tolist())
+
                     summary_row = [''] * len(columns)
                     summary_row[0] = channel
                     summary_row[1] = f'Brand : {brand_value}'
                     summary_row[6] = f'Total {len(channel_df)} Spots'
                     new_data.append(summary_row)
+
                     safe_sheet_name = sanitize_sheet_name(channel)
                     pd.DataFrame(new_data).to_excel(writer, sheet_name=safe_sheet_name, index=False, header=False)
+                    
                     total_rows += len(channel_df)
                     last_sheet_name = safe_sheet_name
                     last_sheet_rows = len(new_data)
+
             if last_sheet_name:
                 grand_total_row = [''] * len(columns)
                 grand_total_row[0] = f'Brand : {brand_value}'
